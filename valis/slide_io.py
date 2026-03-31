@@ -530,7 +530,7 @@ def get_ome_obj(x):
 
 
 def check_is_ome(src_f):
-    is_ome = re.search(".ome", src_f) is not None and re.search(".tif*", src_f) is not None
+    is_ome = re.search("\.ome", src_f) is not None and re.search("\.tif*", src_f) is not None
     if is_ome:
         # Verify that image is valid ome.tiff
         ome_obj = get_ome_obj(src_f)

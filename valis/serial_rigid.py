@@ -1205,13 +1205,38 @@ class SerialRigidRegistrar(object):
                                                  additional_filtering_kwargs=filter_kwargs,
                                                  **filter_kwargs)
 
+                    # Skip this reflection if not enough matches for transform estimation
+                    if filtered_match_info12.matched_kp1_xy is None or len(filtered_match_info12.matched_kp1_xy) < 4:
+                        # Record invalid result with inf error so it won't be selected
+                        reflected_d_vals.append(np.inf)
+                        reflection_M.append(rM)
+                        transforms.append(np.eye(3))
+                        reflected_matches12.append(filtered_match_info12)
+                        reflected_matches21.append(filtered_match_info21)
+                        if keep_unfiltered:
+                            unfiltered_reflected_matches12.append(unfiltered_match_info12)
+                            unfiltered_reflected_matches21.append(unfiltered_match_info21)
+                        continue
+
                     # Record info #
-                    _ = transformer.estimate(filtered_match_info12.matched_kp2_xy, filtered_match_info12.matched_kp1_xy)
+                    estimate_success = transformer.estimate(filtered_match_info12.matched_kp2_xy, filtered_match_info12.matched_kp1_xy)
+                    if not estimate_success or np.any(np.isnan(transformer.params)):
+                        # Transform estimation failed, skip this reflection
+                        reflected_d_vals.append(np.inf)
+                        reflection_M.append(rM)
+                        transforms.append(np.eye(3))
+                        reflected_matches12.append(filtered_match_info12)
+                        reflected_matches21.append(filtered_match_info21)
+                        if keep_unfiltered:
+                            unfiltered_reflected_matches12.append(unfiltered_match_info12)
+                            unfiltered_reflected_matches21.append(unfiltered_match_info21)
+                        continue
+
                     reflected_warped_src_xy = warp_tools.warp_xy(filtered_match_info12.matched_kp1_xy, transformer.params)
                     _,  reflected_d = warp_tools.measure_error(filtered_match_info12.matched_kp2_xy, reflected_warped_src_xy, prev_img_obj.padded_shape_rc)
                     reflected_d_vals.append(reflected_d)
                     reflection_M.append(rM)
-                    transforms.append(transformer.params)
+                    transforms.append(transformer.params.copy())
 
                     # Move matched features to position in original images
                     img_inv_M = np.linalg.inv(rM @ img_obj.T)
