@@ -1801,7 +1801,7 @@ class VipsSlideReader(SlideReader):
 
         if self.use_openslide:
             # Keep rgb=False returns rgba. Makes it possible to avoid having black pixels for background. Can remove alpha channel after
-            vips_slide = pyvips.Image.new_from_file(self.src_f, level=level, autocrop=True, rgb=False, access='random')[0:3]
+            vips_slide = pyvips.Image.new_from_file(self.src_f, level=level, autocrop=True, access='random')[0:3]
 
         elif self.is_ome:
             vips_slide = self._slide2vips_ome_one_series(level=level, *args, **kwargs)
@@ -2005,7 +2005,7 @@ class VipsSlideReader(SlideReader):
         """
 
         n_levels = eval(vips_img.get('openslide.level-count'))
-        slide_dims = np.array([warp_tools.get_shape(pyvips.Image.new_from_file(self.src_f, level=i, autocrop=True, rgb=True))[0:2][::-1] for i in range(n_levels)])
+        slide_dims = np.array([warp_tools.get_shape(pyvips.Image.new_from_file(self.src_f, level=i, autocrop=True))[0:2][::-1] for i in range(n_levels)])
 
         return slide_dims
 

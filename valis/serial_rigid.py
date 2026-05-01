@@ -1200,8 +1200,8 @@ class SerialRigidRegistrar(object):
 
                     reflected_src_xy, reflected_desc = matcher_obj.feature_detector.detect_and_compute(reflected_img)
                     unfiltered_match_info12, filtered_match_info12, unfiltered_match_info21, filtered_match_info21 = \
-                        matcher_obj.match_images(img1=reflected_img, desc1=reflected_desc, kp1_xy=reflected_src_xy,
-                                                 img2=prev_warped, desc2=prev_img_obj.desc, kp2_xy=dst_xy,
+                        matcher_obj.match_images(img1=reflected_img, desc1=reflected_desc, kp1_xy=reflected_src_xy.astype(np.float32),
+                                                 img2=prev_warped, desc2=prev_img_obj.desc, kp2_xy=dst_xy.astype(np.float32),
                                                  additional_filtering_kwargs=filter_kwargs,
                                                  **filter_kwargs)
 

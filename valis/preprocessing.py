@@ -1380,20 +1380,10 @@ def create_edges_mask(labeled_img):
 
 
 def create_tissue_mask_from_rgb(img, brightness_q=0.99, kernel_size=3, gray_thresh=0.075, light_gray_thresh=0.875, dark_gray_thresh=0.7):
-    """Create mask that only covers tissue
+    """Create mask that covers tissue using relaxed Otsu + convex hull.
 
-    Also remove dark regions on the edge of the slide, which could be artifacts
-
-    Parameters
-    ----------
-    grey_thresh : float
-        Colorfulness values (from JCH) below this are considered "grey", and thus possibly dirt, hair, coverslip edges, etc...
-
-    light_gray_thresh : float
-        Upper limit for light gray
-
-    dark_gray_thresh : float
-        Upper limit for dark gray
+    Robust to IHC slides with light staining where color-based methods
+    tend to miss tissue regions.
 
     Returns
     -------
@@ -1401,38 +1391,28 @@ def create_tissue_mask_from_rgb(img, brightness_q=0.99, kernel_size=3, gray_thre
         Mask covering tissue
 
     concave_tissue_mask : ndarray
-        Similar to `tissue_mask`,  but each region is replaced by a concave hull.
-        Covers more area
+        Convex hull of the largest connected component
 
     """
-    # Ignore artifacts that could throw off thresholding. These are often greyish in color
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    otsu_thresh, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    relaxed_thresh = min(255, otsu_thresh + int(otsu_thresh * 0.15))
+    tissue_mask = (gray < relaxed_thresh).astype(np.uint8) * 255
 
-    jch = rgb2jch(img)
-    light_greys = 255*((jch[..., 1] < gray_thresh) & (jch[..., 0] < light_gray_thresh)).astype(np.uint8)
-    dark_greys = 255*((jch[..., 1] < gray_thresh) & (jch[..., 0] < dark_gray_thresh)).astype(np.uint8)
-    grey_mask = combine_masks_by_hysteresis([light_greys, dark_greys])
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    tissue_mask = cv2.morphologyEx(tissue_mask, cv2.MORPH_CLOSE, kernel)
+    tissue_mask = cv2.morphologyEx(tissue_mask, cv2.MORPH_OPEN, kernel)
 
-    color_mask = 255 - grey_mask
+    # Convex hull of largest connected component
+    concave_tissue_mask = tissue_mask.copy()
+    contours, _ = cv2.findContours(tissue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        hull = cv2.convexHull(largest)
+        concave_tissue_mask = np.zeros_like(tissue_mask)
+        cv2.drawContours(concave_tissue_mask, [hull], -1, 255, -1)
 
-    cam_d, cam = calc_background_color_dist(img, brightness_q=brightness_q, mask=color_mask)
-
-    # Reduce intensity of thick horizontal and vertial lines, usually artifacts like edges, streaks, folds, etc...
-    vert_knl = np.ones((1, 5))
-    no_v_lines = morphology.opening(cam_d, vert_knl)
-
-    horiz_knl = np.ones((5, 1))
-    no_h_lines = morphology.opening(cam_d, horiz_knl)
-    cam_d_no_lines = np.dstack([no_v_lines, no_h_lines]).min(axis=2)
-
-    # Foreground is where color is different than backaground color
-    cam_d_t, _ = filters.threshold_multiotsu(cam_d_no_lines[grey_mask == 0])
-    tissue_mask = np.zeros(cam_d_no_lines.shape, dtype=np.uint8)
-    tissue_mask[cam_d_no_lines >= cam_d_t] = 255
-
-    concave_tissue_mask = mask2contours(tissue_mask, kernel_size)
-    cleaned_mask = clean_mask(mask=concave_tissue_mask, img=img)
-
-    return tissue_mask, cleaned_mask
+    return tissue_mask, concave_tissue_mask
 
 
 def jc_dist(img, cspace="IHLS", p=99, metric="euclidean"):

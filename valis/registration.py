@@ -989,8 +989,18 @@ class Slide(object):
         if reader is None:
             reader = self.reader
 
-        warped_slide = slide_tools.warp_slide(src_f, M=self.M,
-                                              transformation_src_shape_rc=self.processed_img_shape_rc,
+        rigid_M = self.M
+        rigid_src_shape_rc = self.processed_img_shape_rc
+        if src_f == self.src_f and hasattr(self, "initial_M_proc_fwd"):
+            # initial_M_proc_fwd maps original processed slide coordinates to
+            # the pre-aligned processed coordinates used for rigid refinement.
+            # Compose it with the refined residual so full-resolution warping
+            # follows the same coordinate chain as the QC images.
+            rigid_M = self.M @ self.initial_M_proc_fwd
+            rigid_src_shape_rc = self.initial_processed_img_shape_rc
+
+        warped_slide = slide_tools.warp_slide(src_f, M=rigid_M,
+                                              transformation_src_shape_rc=rigid_src_shape_rc,
                                               transformation_dst_shape_rc=self.reg_img_shape_rc,
                                               aligned_slide_shape_rc=aligned_slide_shape,
                                               dxdy=bk_dxdy, level=level, series=self.series,
@@ -1789,6 +1799,7 @@ class Valis(object):
                  norm_method=DEFAULT_NORM_METHOD,
                  micro_rigid_registrar_cls=None,
                  micro_rigid_registrar_params={},
+                 initial_rigid_transforms=None,
                  qt_emitter=None):
 
         """
@@ -2103,6 +2114,8 @@ class Valis(object):
         self.rigid_registrar = None
         self.micro_rigid_registrar_cls = micro_rigid_registrar_cls
         self.micro_rigid_registrar_params = micro_rigid_registrar_params
+        self.initial_rigid_transforms = initial_rigid_transforms  # dict: {slide_filename: M_inv_fullres}
+        self._initial_M_proc = {}  # processed 空间的初始变换，rigid 后组合用
         self.denoise_rigid = denoise_rigid
 
         if feature_detector_cls is not None:
@@ -3092,6 +3105,59 @@ class Valis(object):
 
         return self.mask_dict[overlap_type]
 
+    @staticmethod
+    def _mask_iou(mask_a, mask_b):
+        a = mask_a > 0
+        b = mask_b > 0
+        union = np.count_nonzero(a | b)
+        if union == 0:
+            return 0.0
+        return np.count_nonzero(a & b) / union
+
+    def _gate_initial_residual_rigid(self, slide_obj, candidate_M):
+        """Accept residual rigid refinement only when it improves pre-aligned masks."""
+        if not (self._initial_M_proc and slide_obj.name in self._initial_M_proc):
+            return candidate_M
+
+        ref_slide = self.get_ref_slide()
+        src_mask = slide_obj.rigid_reg_mask
+        ref_mask = ref_slide.rigid_reg_mask
+        target_shape_rc = slide_obj.processed_img.shape[:2]
+        if src_mask.shape[:2] != target_shape_rc:
+            src_mask = cv2.resize(src_mask, target_shape_rc[::-1], interpolation=cv2.INTER_NEAREST)
+        if ref_mask.shape[:2] != target_shape_rc:
+            ref_mask = cv2.resize(ref_mask, target_shape_rc[::-1], interpolation=cv2.INTER_NEAREST)
+        out_wh = (ref_mask.shape[1], ref_mask.shape[0])
+
+        identity_M = np.eye(3)
+        base_iou = self._mask_iou(src_mask, ref_mask)
+        warped_mask = cv2.warpAffine(src_mask, candidate_M[:2, :], out_wh,
+                                     flags=cv2.INTER_NEAREST, borderValue=0)
+        candidate_iou = self._mask_iou(warped_mask, ref_mask)
+
+        linear = candidate_M[:2, :2]
+        singular_vals = np.linalg.svd(linear, compute_uv=False)
+        scale_dev = float(np.max(np.abs(singular_vals - 1.0)))
+        angle = float(np.degrees(np.arctan2(candidate_M[1, 0], candidate_M[0, 0])))
+        translation = float(np.linalg.norm(candidate_M[:2, 2]))
+
+        too_large = abs(angle) > 5.0 or translation > 45.0 or scale_dev > 0.06
+        no_mask_gain = candidate_iou < base_iou + 0.01
+        if too_large or no_mask_gain:
+            print(
+                f"Rejecting residual rigid for {slide_obj.name}: "
+                f"IoU {base_iou:.3f}->{candidate_iou:.3f}, "
+                f"angle={angle:.2f}, trans={translation:.1f}, scale_dev={scale_dev:.3f}"
+            )
+            return identity_M
+
+        print(
+            f"Accepting residual rigid for {slide_obj.name}: "
+            f"IoU {base_iou:.3f}->{candidate_iou:.3f}, "
+            f"angle={angle:.2f}, trans={translation:.1f}, scale_dev={scale_dev:.3f}"
+        )
+        return candidate_M
+
     def extract_rigid_transforms_from_serial_rigid(self, rigid_registrar):
         """
         If rigid transforms were found on cropped images, they will need to be
@@ -3131,6 +3197,21 @@ class Valis(object):
 
             prev_s = np.array(prev_slide_obj.processed_img_shape_rc)/np.array(prev_slide_obj.uncropped_processed_img_shape_rc)
             kp2_xy_in_uncropped_scaled = prev_s*(match_info.matched_kp2_xy + prev_slide_obj.processed_crop_bbox[0:2])
+            uncropped_matches = {slide_obj.name: kp1_xy_in_uncropped_scaled,
+                                 prev_slide_obj.name: kp2_xy_in_uncropped_scaled}
+
+            # If user provided final rigid transforms via do_rigid dict, use
+            # the already-scaled M from rigid_register_partial instead of
+            # re-estimating from feature matches. initial_rigid_transforms are
+            # only a pre-alignment seed, so they must still be refined here.
+            if isinstance(self.do_rigid, dict):
+                scaled_M = img_obj.M
+                prev_M = scaled_M
+                slide_M_dict[slide_obj.name] = scaled_M
+                cropped_M_dict[slide_obj.name] = img_obj.M
+                matches_dict[slide_obj.name] = uncropped_matches
+                continue
+
             kp2_xy_in_uncropped_warped = warp_tools.warp_xy(kp2_xy_in_uncropped_scaled, M=prev_M)
 
             # Estimate transform
@@ -3143,6 +3224,7 @@ class Valis(object):
                 scaled_M = M_tform.params
 
             scaled_M = rigid_registrar.check_M(kp1_xy_in_uncropped_scaled, kp2_xy_in_uncropped_warped, scaled_M)
+            scaled_M = self._gate_initial_residual_rigid(slide_obj, scaled_M)
             prev_M = scaled_M
 
 
@@ -3150,9 +3232,6 @@ class Valis(object):
             cropped_M_dict[slide_obj.name] = img_obj.M
 
             # Update match dictionary
-            uncropped_matches = {slide_obj.name: kp1_xy_in_uncropped_scaled,
-                                 prev_slide_obj.name: kp2_xy_in_uncropped_scaled}
-
             matches_dict[slide_obj.name] = uncropped_matches
 
         # Determine size of output images and any padding need to get them all to fit
@@ -3184,6 +3263,12 @@ class Valis(object):
             slide_M_dict[slide_obj.name] = M
 
         cropped_registerd_out_shape_rc = rigid_registrar.img_obj_list[0].registered_shape_rc
+
+        # When initial_rigid_transforms are used, processed images have already
+        # been pre-warped before rigid registration. slide_M_dict therefore
+        # contains the residual transform from pre-warped processed space to
+        # registered space. Full-resolution slide warping composes that residual
+        # with slide_obj.initial_M_proc_fwd in Slide.warp_slide().
 
         return slide_M_dict, registerd_out_shape_rc, cropped_M_dict, cropped_registerd_out_shape_rc, matches_dict
 
@@ -3266,6 +3351,9 @@ class Valis(object):
 
         do_rematch = (matcher_for_sorting.__class__.__name__ != matcher.__class__.__name__) \
             or (matcher_for_sorting.feature_detector.__class__.__name__ != matcher.feature_detector.__class__.__name__)
+        # Skip expensive re-match when user provided rigid transforms
+        if isinstance(self.do_rigid, dict):
+            do_rematch = False
         if do_rematch:
             msg = (f"Images sorted using {matcher_for_sorting.__class__.__name__} features. "
                    f"Will now use {matcher.__class__.__name__} to match images using {matcher.feature_detector.__class__.__name__} features")
@@ -3277,7 +3365,7 @@ class Valis(object):
             rigid_registrar.update_match_dicts_with_neighbor_filter(transformer, matcher)
 
         if self.reference_img_f is not None:
-            ref_name = self.name_dict[self.reference_img_f]
+            ref_name = self.name_dict.get(self.reference_img_f, valtils.get_name(self.reference_img_f))
         else:
             ref_name = valtils.get_name(rigid_registrar.reference_img_f)
             if self.do_rigid is not False:
@@ -3288,7 +3376,18 @@ class Valis(object):
 
         # Get output shapes #
         if tform_dict is None:
-            named_tform_dict = {o.name: {"M":np.eye(3)} for o in rigid_registrar.img_obj_list}
+            if self._initial_M_proc:
+                # Initial transforms already pre-warped to ref space.
+                # Identity M should be in processed space, not full-res.
+                named_tform_dict = {
+                    o.name: {
+                        "M": np.eye(3),
+                        TFORM_SRC_SHAPE_KEY: o.image.shape[0:2],
+                        TFORM_DST_SHAPE_KEY: o.image.shape[0:2],
+                    } for o in rigid_registrar.img_obj_list
+                }
+            else:
+                named_tform_dict = {o.name: {"M":np.eye(3)} for o in rigid_registrar.img_obj_list}
         else:
             named_tform_dict = {valtils.get_name(k):v for k, v in tform_dict.items()}
 
@@ -3333,7 +3432,7 @@ class Valis(object):
             else:
                 og_dst_shape_rc = ref_slide_obj.slide_dimensions_wh[0][::-1]
 
-            img_corners_xy = warp_tools.get_corners_of_image(matching_rigid_obj.image.shape)[::-1]
+            img_corners_xy = warp_tools.get_corners_of_image(matching_rigid_obj.image.shape)[:, ::-1]
             warped_corners = warp_tools.warp_xy(img_corners_xy, M=temp_M,
                                     transformation_src_shape_rc=og_src_shape_rc,
                                     transformation_dst_shape_rc=og_dst_shape_rc,
@@ -3369,6 +3468,8 @@ class Valis(object):
 
             prev_M = img_obj.M
 
+        rigid_registrar.transformer = transformer
+
         # Add registered image
         for img_obj in rigid_registrar.img_obj_list:
             img_obj.M_inv = np.linalg.inv(img_obj.M)
@@ -3380,6 +3481,99 @@ class Valis(object):
             img_obj.registered_shape_rc = img_obj.registered_img.shape[0:2]
 
         return rigid_registrar
+
+    def _apply_initial_rigid_transforms(self):
+        """Pre-warp processed images using initial rigid transforms.
+
+        Updates processed images, masks, and metadata so that subsequent
+        rigid registration works on pre-aligned images.
+        Stores processed-space initial transforms for later composition.
+        """
+        import cv2 as _cv2
+
+        ref_slide = self.get_ref_slide()
+        ref_shape = ref_slide.processed_img.shape[:2]
+
+        print("\n==== Applying initial rigid transforms\n")
+        for slide_fname, tform_info in self.initial_rigid_transforms.items():
+            if isinstance(tform_info, dict):
+                M_inv_full = tform_info[TFORM_MAT_KEY]
+            else:
+                M_inv_full = tform_info
+            M_inv_full = np.asarray(M_inv_full, dtype=np.float64)
+
+            slide_name = valtils.get_name(slide_fname)
+            if slide_name not in self.slide_dict:
+                continue
+            slide_obj = self.slide_dict[slide_name]
+            if slide_obj == ref_slide:
+                continue
+
+            proc_img = slide_obj.processed_img
+            proc_shape = proc_img.shape[:2]
+            mask = slide_obj.rigid_reg_mask
+
+            # 全分辨率正向矩阵 (moving → ref)
+            M_fwd_full = np.linalg.inv(M_inv_full)
+
+            mov_full_wh = slide_obj.slide_dimensions_wh[0]
+            ref_full_wh = ref_slide.slide_dimensions_wh[0]
+
+            # 坐标链: cropped_mov → uncropped_mov → full_mov → full_ref → uncropped_ref → cropped_ref
+            # 1) cropped → uncropped: 平移 crop_bbox 偏移
+            mov_bbox = slide_obj.processed_crop_bbox  # [x, y, w, h]
+            mov_uncropped_shape = slide_obj.uncropped_processed_img_shape_rc
+            T_mov_uncrop = np.array([[1, 0, mov_bbox[0]],
+                                     [0, 1, mov_bbox[1]],
+                                     [0, 0, 1]], dtype=np.float64)
+
+            # 2) uncropped → full_res
+            S_mov_to_full = np.diag([mov_full_wh[0] / mov_uncropped_shape[1],
+                                     mov_full_wh[1] / mov_uncropped_shape[0], 1.0])
+
+            # 3) M_fwd_full: full_mov → full_ref
+
+            # 4) full_ref → uncropped_ref
+            ref_uncropped_shape = ref_slide.uncropped_processed_img_shape_rc
+            S_full_to_ref = np.diag([ref_uncropped_shape[1] / ref_full_wh[0],
+                                     ref_uncropped_shape[0] / ref_full_wh[1], 1.0])
+
+            # 5) uncropped_ref → cropped_ref: 平移 ref crop_bbox 偏移
+            ref_bbox = ref_slide.processed_crop_bbox
+            T_ref_crop = np.array([[1, 0, -ref_bbox[0]],
+                                   [0, 1, -ref_bbox[1]],
+                                   [0, 0, 1]], dtype=np.float64)
+
+            M_proc_fwd = T_ref_crop @ S_full_to_ref @ M_fwd_full @ S_mov_to_full @ T_mov_uncrop
+            M_proc_inv = np.linalg.inv(M_proc_fwd)
+
+            # Warp processed image
+            warped_img = _cv2.warpAffine(proc_img, M_proc_fwd[:2, :],
+                                         (ref_shape[1], ref_shape[0]),
+                                         borderValue=255)
+            warped_mask = _cv2.warpAffine(mask, M_proc_fwd[:2, :],
+                                          (ref_shape[1], ref_shape[0]),
+                                          flags=_cv2.INTER_NEAREST,
+                                          borderValue=0)
+
+            # 更新 slide_obj 元数据为 ref 的值
+            slide_obj.processed_img = warped_img
+            slide_obj.rigid_reg_mask = warped_mask
+            slide_obj.processed_img_shape_rc = np.array(ref_shape)
+            slide_obj.uncropped_processed_img_shape_rc = np.array(ref_shape)
+            slide_obj.processed_crop_bbox = np.array([0, 0, ref_shape[1], ref_shape[0]])
+
+            # 保存到磁盘
+            warp_tools.save_img(slide_obj.processed_img_f, warped_img)
+
+            # Store the processed-space initial transform so full-resolution
+            # slide warping can compose initial coarse alignment + refined
+            # residual rigid transform.
+            slide_obj.initial_M_proc_fwd = M_proc_fwd
+            slide_obj.initial_processed_img_shape_rc = np.array(proc_shape)
+            self._initial_M_proc[slide_name] = M_proc_fwd
+
+            print(f"  {slide_fname}: {proc_shape} -> {ref_shape}")
 
     def rigid_register(self):
         """Rigidly register slides
@@ -3395,6 +3589,10 @@ class Valis(object):
 
         if self.denoise_rigid:
             self.denoise_images()
+
+        # 如果有初始变换，先预对齐 processed 图
+        if self.initial_rigid_transforms is not None:
+            self._apply_initial_rigid_transforms()
 
         print("\n==== Rigid registration\n")
         if self.do_rigid is True:
@@ -3688,7 +3886,10 @@ class Valis(object):
             for_summary = exposure.equalize_adapthist(for_summary)
             summary_img = np.dstack([for_summary, summary_img]).max(axis=2)
 
-        summary_img /= summary_img.max()
+        summary_max = summary_img.max()
+        if summary_max == 0:
+            return self._create_non_rigid_reg_mask_from_rigid_masks(slide_list=slide_list)
+        summary_img /= summary_max
         hyst_thresh = min(self.size-0.5, 2)
         combo_mask = 255*filters.apply_hysteresis_threshold(combo_mask, 0.5, hyst_thresh).astype(np.uint8) # At least 2 masks are touching
 
@@ -3699,18 +3900,46 @@ class Valis(object):
             warped_processed = slide_obj.warp_img(slide_obj.pad_cropped_processed_img(), non_rigid=False, crop=False).astype(float)
             if combo_mask.max() > 0:
                 warped_processed[combo_mask == 0] = 0
-            weighted_processed = summary_img*(warped_processed/warped_processed.max())
-            weighted_processed = exposure.equalize_adapthist(weighted_processed)
-            wt, _ = filters.threshold_multiotsu(weighted_processed)
-            weighted_mask = 255*(weighted_processed > wt).astype(np.uint8)
+            warped_max = warped_processed.max()
+            if warped_max == 0:
+                weighted_mask = slide_obj.warp_img(slide_obj.rigid_reg_mask, non_rigid=False,
+                                                   crop=False, interp_method="nearest")
+            else:
+                weighted_processed = summary_img*(warped_processed/warped_max)
+                weighted_processed = exposure.equalize_adapthist(weighted_processed)
+                finite_values = weighted_processed[np.isfinite(weighted_processed)]
+                if len(np.unique(finite_values)) < 3:
+                    weighted_mask = 255*(weighted_processed > 0).astype(np.uint8)
+                else:
+                    try:
+                        wt, _ = filters.threshold_multiotsu(weighted_processed)
+                    except ValueError:
+                        wt = filters.threshold_otsu(weighted_processed)
+                    weighted_mask = 255*(weighted_processed > wt).astype(np.uint8)
             weighted_mask = preprocessing.mask2contours(weighted_mask, 1)
             weighted_mask_list[i] = weighted_mask
             weighted_combo_mask[weighted_mask > 0] += 1
 
         temp_non_rigid_mask = 255*filters.apply_hysteresis_threshold(weighted_combo_mask, 0.5, hyst_thresh).astype(np.uint8) # At least 2 masks are touching
-        overlap_mask = preprocessing.mask2bbox_mask(temp_non_rigid_mask)
+        overlap_mask = self._postprocess_non_rigid_tissue_mask(
+            temp_non_rigid_mask,
+            slide_list=slide_list,
+        )
 
         return overlap_mask
+
+    def _postprocess_non_rigid_tissue_mask(self, mask, slide_list=None):
+        """Keep non-rigid registration inside tissue instead of a bounding box."""
+        tissue_mask = (mask > 0).astype(np.uint8) * 255
+        if tissue_mask.max() == 0:
+            return self._create_non_rigid_reg_mask_from_bbox(slide_list=slide_list)
+
+        tissue_mask = 255 * ndimage.binary_fill_holes(tissue_mask).astype(np.uint8)
+        tissue_mask = preprocessing.mask2contours(tissue_mask, kernel_size=3)
+        if tissue_mask.max() == 0:
+            return self._create_non_rigid_reg_mask_from_bbox(slide_list=slide_list)
+
+        return tissue_mask
 
     def _create_non_rigid_reg_mask_from_rigid_masks(self, slide_list=None):
         """
@@ -3729,9 +3958,8 @@ class Valis(object):
 
         temp_mask = 255*filters.apply_hysteresis_threshold(combo_mask, 0.5, self.size-0.5).astype(np.uint8)
 
-        # Draw convex hull around each region
-        final_mask = 255*ndimage.binary_fill_holes(temp_mask).astype(np.uint8)
-        final_mask = preprocessing.mask2contours(final_mask)
+        # Keep the shared tissue footprint, not the enclosing rectangle.
+        final_mask = self._postprocess_non_rigid_tissue_mask(temp_mask, slide_list=slide_list)
 
         return final_mask
 
@@ -5372,6 +5600,3 @@ class Valis(object):
                                    compression=compression, Q=Q, pyramid=pyramid)
 
         return merged_slide, all_channel_names, ome_xml
-
-
-

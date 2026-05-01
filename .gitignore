@@ -239,4 +239,12 @@ tests/test_warp_assoc_imgs.py
 
 tests/test_warp_fxns.py
 
-test_data/*
+raw_data
+
+registered_data
+
+passed_data
+
+excluded_data
+
+retry_data
